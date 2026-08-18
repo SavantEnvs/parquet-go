@@ -1,0 +1,100 @@
+//go:build go1.18
+
+// mayhem harness — whole-file Parquet reader.
+//
+// This target does NOT exist upstream: upstream's own fuzz tests only exercise
+// individual sub-formats (the variant encoding, column encodings). Feeding raw
+// bytes straight to parquet.OpenFile/parquet.NewReader instead exercises the
+// part of the format where malformed-file bugs actually live: the "PAR1"
+// magic, the thrift-encoded footer (FileMetaData), row-group/column-chunk
+// layout, page headers, and the per-column encodings/codecs as pages are
+// decoded while iterating rows.
+//
+// No file I/O (see docs/netnew-worker-prompt.md §3): bytes come only from the
+// fuzzer; starter seeds (real upstream testdata/*.parquet fixtures) are wired
+// via the Mayhemfile `testsuite:` directive, not read from disk here.
+//
+// BOUNDING (load-bearing — see docs/netnew-worker-prompt.md's repo-specific
+// intel): a Parquet footer is attacker-controlled and read *before* it is
+// validated against how much data actually exists. In particular OpenFile
+// decodes a footer-length field out of the trailing bytes of the input and
+// immediately does `make([]byte, footerSize)` for it; a tiny input can claim
+// a multi-gigabyte footer. That is a resource-exhaustion path, not a parsing
+// bug we're trying to surface, so this harness independently reads the same
+// trailing length field and skips inputs whose declared footer size could not
+// possibly be satisfied by the bytes on hand, before ever calling OpenFile.
+// Rows are also read one at a time up to a hard cap, never using a count
+// derived from the (attacker-controlled) footer to size an allocation.
+//
+// This file is committed as `.go.src` (a non-.go name) so it is never picked
+// up as an ordinary package file by `go build`/`go test`. mayhem/build.sh
+// copies it into a FRESH, single-file package under `_mayhem_harness/` (the
+// leading underscore makes every Go tool — build, vet, `go test ./...` —
+// ignore it automatically for wildcard patterns) for the go-118-fuzz-build
+// step, which is given the directory explicitly and so still finds it.
+// It is NOT copied into the repo root: that package directory already mixes
+// `package parquet` and `package parquet_test` files (upstream ships both),
+// and go-118-fuzz-build's package loader rejects a directory containing two
+// different package names ("found packages parquet and parquet_test in
+// /mayhem"). A fresh single-package directory sidesteps that entirely.
+
+package wholefile
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/parquet-go/parquet-go"
+)
+
+func FuzzMayhemWholeFile(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// A Parquet file is at minimum: 4-byte magic + footer + 4-byte
+		// footer-length + 4-byte magic. Anything shorter can't even carry a
+		// footer-length field.
+		if len(data) < 12 {
+			return
+		}
+
+		footerSize := int64(binary.LittleEndian.Uint32(data[len(data)-8 : len(data)-4]))
+		if footerSize < 0 || footerSize > int64(len(data)) {
+			// A declared footer bigger than the whole input is malformed by
+			// construction; OpenFile would `make([]byte, footerSize)` for it
+			// before discovering that. Skip rather than let it OOM the fuzzer.
+			return
+		}
+
+		pf, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			// Malformed input is an expected outcome, not a finding.
+			return
+		}
+
+		// NewReader on an already-opened *parquet.File cannot itself fail to
+		// open (openFile short-circuits on the *File type), but downstream
+		// schema/row-group setup driven by attacker-controlled metadata can
+		// still legitimately panic — that IS a finding, so it is not
+		// recovered here.
+		r := parquet.NewReader(pf)
+
+		// ReadRows drives the full decode path (page headers, per-column
+		// encodings, compression codecs, dictionaries) into raw column
+		// Values without a further reconstruct-into-Go-type step, which
+		// keeps the harness focused on the parsing surface itself. The
+		// batch size and iteration count are both fixed, independent of
+		// anything the (attacker-controlled) footer claims about row counts.
+		const batch, maxBatches = 16, 64
+		buf := make([]parquet.Row, batch)
+		for i := 0; i < maxBatches; i++ {
+			for j := range buf {
+				buf[j] = buf[j][:0]
+			}
+			n, err := r.ReadRows(buf)
+			_ = n
+			if err != nil {
+				break
+			}
+		}
+	})
+}

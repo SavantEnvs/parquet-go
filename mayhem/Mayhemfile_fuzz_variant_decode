@@ -1,0 +1,8 @@
+project: savantenvs/parquet-go
+target: fuzz_variant_decode
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz_variant_decode/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_variant_decode
+    libfuzzer: true

@@ -1,0 +1,59 @@
+//go:build go1.18
+
+// mayhem harness — DELTA_BYTE_ARRAY column-encoding decoder.
+//
+// Fuzzes delta.ByteArrayEncoding.DecodeByteArray directly on arbitrary bytes,
+// i.e. bytes an attacker fully controls as already-"encoded" column data
+// inside a page (the whole-file target above gets here too, but only for
+// pages that survive the footer/thrift/page-header gauntlet first — this
+// target reaches the decoder directly so the fuzzer doesn't have to also
+// construct a valid file around it).
+//
+// This is a NEW harness rather than a build of upstream's native
+// FuzzDeltaByteArray (encoding/delta/delta_test.go): that native fuzz
+// function has a two-argument signature (`func(t *testing.T, input []byte,
+// seed int64)`) whose second argument only makes sense together with
+// go-fuzz-headers' own byte-consumption format under go-118-fuzz-build, so a
+// go-wrapper corpus file decoded to raw bytes wouldn't reproducibly seed both
+// arguments. It also round-trips encode(generate(fuzz bytes)) then decode,
+// which tests encoder/decoder agreement rather than decoder robustness
+// against arbitrary (i.e. attacker-supplied) already-encoded bytes. Calling
+// DecodeByteArray directly on the fuzz bytes is simpler, needs only a single
+// []byte seed, and targets the actual security-relevant surface: decoding
+// untrusted column data.
+//
+// The encoding itself already guards the classic "declared count says
+// millions of values" resource-exhaustion trap (see
+// encoding/delta/binary_packed.go's maxSupportedBlockSize), so no extra
+// bounding is added here.
+//
+// No file I/O: bytes come only from the fuzzer; starter seeds are wired via
+// the Mayhemfile `testsuite:` directive.
+//
+// Committed as `.go.src` so it is never picked up as an ordinary package file
+// by `go build`/`go test`. mayhem/build.sh copies it into a FRESH,
+// single-file package under `_mayhem_harness/` (the leading underscore makes
+// every Go tool — build, vet, `go test ./...` — ignore it automatically for
+// wildcard patterns) for the go-118-fuzz-build step, which is given the
+// directory explicitly and so still finds it. It is NOT copied into
+// encoding/delta/: that package directory already mixes `package delta` and
+// `package delta_test` files (upstream ships both), and go-118-fuzz-build's
+// package loader rejects a directory containing two different package names.
+// A fresh single-package directory sidesteps that entirely.
+
+package deltabytearray
+
+import (
+	"testing"
+
+	"github.com/parquet-go/parquet-go/encoding/delta"
+)
+
+func FuzzMayhemDeltaByteArrayDecode(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		enc := new(delta.ByteArrayEncoding)
+		// Malformed/truncated encoded data is an expected outcome (returned
+		// error), not a finding.
+		_, _, _ = enc.DecodeByteArray(nil, data, nil)
+	})
+}
