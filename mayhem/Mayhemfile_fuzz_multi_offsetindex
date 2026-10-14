@@ -1,0 +1,8 @@
+# seed-from: https://app.mayhem.security/savantenvs/parquet-go/fuzz-wholefile
+project: savantenvs/parquet-go
+target: fuzz_multi_offsetindex-mined-fc63132
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+cmds:
+  - cmd: /mayhem/fuzz_multi_offsetindex
+    libfuzzer: true

@@ -1,0 +1,80 @@
+//go:build go1.18
+
+// mayhem harness — merged row groups' offset index.
+//
+// Opens a Parquet file from the fuzzer's bytes, merges its row groups with
+// parquet.MultiRowGroup, merges the result with itself (twice) so the column
+// chunks are the flattened product of already-merged row groups, and walks the
+// merged column chunks' OffsetIndex page by page. This is the code path of
+// multiColumnChunk.OffsetIndex / multiOffsetIndex, which no other target
+// reaches. Seeds are Parquet files that carry a page index (the writer's
+// default); a file without one ends the call early with ErrMissingOffsetIndex.
+//
+// No file I/O: bytes come only from the fuzzer. Copied by mayhem/build.sh into
+// a fresh single-package directory under `_mayhem_harness/` (see build.sh).
+
+package multioffset
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/parquet-go/parquet-go"
+)
+
+func FuzzMayhemMultiOffsetIndex(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) < 12 {
+			return
+		}
+		// OpenFile allocates the footer size claimed by the trailing length
+		// field before validating it; skip claims the input cannot satisfy.
+		footerSize := int64(binary.LittleEndian.Uint32(data[len(data)-8 : len(data)-4]))
+		if footerSize > int64(len(data)) {
+			return
+		}
+
+		pf, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return
+		}
+
+		rowGroups := pf.RowGroups()
+		if len(rowGroups) == 0 {
+			return
+		}
+		if len(rowGroups) > 16 {
+			rowGroups = rowGroups[:16]
+		}
+
+		merged := parquet.MultiRowGroup(rowGroups...)
+		merged = parquet.MultiRowGroup(merged, merged)
+		merged = parquet.MultiRowGroup(merged, merged)
+
+		const maxPages = 1024
+		for _, chunk := range merged.ColumnChunks() {
+			index, err := chunk.OffsetIndex()
+			if err != nil {
+				continue
+			}
+			n := index.NumPages()
+			if n > maxPages {
+				n = maxPages
+			}
+			prev := int64(-1)
+			for i := 0; i < n; i++ {
+				_ = index.Offset(i)
+				_ = index.CompressedPageSize(i)
+				row := index.FirstRowIndex(i)
+				if row < prev {
+					// Row offsets of consecutive pages never go backwards in a
+					// well-formed merge; a file that makes them do so is data,
+					// not a crash, so just stop walking this chunk.
+					break
+				}
+				prev = row
+			}
+		}
+	})
+}
